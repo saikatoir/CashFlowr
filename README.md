@@ -14,7 +14,8 @@ BoxBazar replaces the constant DM grind. A seller connects her Facebook Page; an
 - **Multimodal** — reads customer-sent product photos, matches against the seller's catalog.
 - **Bangla-aware** — infers `bhai` / `apu` from the customer's name, mirrors the seller's voice from starred conversations.
 - **Order approval queue** — every AI-drafted order lands as `pending_approval`; seller confirms with one click.
-- **Courier integration** — Steadfast, Pathao, RedX (book consignment, label PDF, status webhooks).
+- **Courier integration** — Steadfast, Pathao, RedX (book consignment, label PDF via `pdf-lib` + `bwip-js`, status webhooks, 4-hour status poller fallback).
+- **Payout reconciliation** — match courier payout line items against shipped consignments at `/reconciliation`.
 - **Two-factor authentication** — admin-gated platform settings, email-delivered 6-character codes.
 - **Owner / admin panel** — `/login/admin-p` for the platform owner; impersonate any user for support without seeing private data.
 
@@ -35,14 +36,26 @@ BoxBazar replaces the constant DM grind. A seller connects her Facebook Page; an
 
 ```
 apps/
-  api/         Fastify API + BullMQ workers + Prisma client wiring
-  web/         Next.js dashboard
+  api/         Fastify API + BullMQ messenger worker + courier status poller
+    src/routes/    auth, stores, products, conversations, orders,
+                   consignments, courier-accounts, facebook, webhooks,
+                   platform-config, owner, chat-parse, health
+    src/lib/       ai, encryption (AES-GCM), mailer (SMTP), mfa, otp,
+                   messenger-pipeline, messenger-queue, status-poller,
+                   label-pdf, meta, prisma, redis, sms, tokens
+  web/         Next.js 14 dashboard
+    src/app/(auth)        login (incl. /login/admin-p), register
+    src/app/(onboarding)  onboarding
+    src/app/(dashboard)   dashboard, inbox, orders, products,
+                          settings, platform-setup, reconciliation, owner
 packages/
-  ai-engine/   Two-stage AI receptionist (intent → response + order extraction)
-  meta-sdk/    Messenger webhook + Send API + attachment fetcher
-  courier-sdk/ Steadfast / Pathao / RedX clients
-  shared/      Shared validators (BD phone, address) used by API + engine
-  db/          Prisma schema + generated client
+  ai-engine/   Two-stage receptionist (intent → response + order extraction),
+               tone profiles, curated few-shot examples, Gemini + Mock providers
+  meta-sdk/    Messenger webhook verify, Send API, attachment fetcher,
+               long-lived token exchange
+  courier-sdk/ Steadfast / Pathao / RedX adapters + factory
+  shared/      BD phone validator, BD locations data, order schemas (zod)
+  db/          Prisma schema + migrations + generated client
 ```
 
 ## Quick start
@@ -94,7 +107,10 @@ The first user to register is auto-promoted to admin. From there:
 ## Architecture highlights
 
 - **Two-stage AI pipeline.** Stage 1 is a cheap intent classifier; Stage 2 generates the actual reply + extracts order entities. Image messages skip Stage 1 entirely (saves a call).
-- **Few-shot learning per shop.** Sellers star their best conversations; those are injected into the system prompt as "examples from this shop." A curated 32-conversation library ships as the baseline for new sellers.
+- **Queued ingestion.** Meta posts a webhook → API verifies the HMAC signature against the raw bytes → event enqueued in BullMQ → worker runs the AI pipeline → reply sent via Send API. The HTTP handler returns 200 immediately, decoupling Meta retries from LLM latency.
+- **Status reconciliation.** Courier webhooks are the primary signal; a 4-hour Redis-locked poller (`status-poller.ts`) sweeps in-flight consignments as a fallback so a missed webhook never leaves an order stuck.
+- **Secrets at rest.** Page access tokens, courier credentials, and platform-config secrets are AES-GCM encrypted with a 32-byte hex `ENCRYPTION_KEY` before hitting Postgres.
+- **Few-shot learning per shop.** Sellers star their best conversations (`Conversation.useAsExample`); those are injected into the system prompt as "examples from this shop." A curated 32-conversation library ships as the baseline for new sellers.
 - **Name-aware salutation.** The AI infers `bhai` / `apu` from typical Bangladeshi name patterns; stays neutral on ambiguous or foreign names; mirrors customer self-references.
 - **Budget guardrail.** Per-customer rate limit (30 inbound msgs / hour) keeps a single chatty customer from blowing the per-seller LLM budget. Long-lived Facebook page tokens prevent the "reconnect every 60 minutes" trap.
 - **Admin impersonation.** The platform owner can open any user's `/settings` to configure on their behalf without seeing inbox / orders / private data. Every impersonation is audit-logged.
